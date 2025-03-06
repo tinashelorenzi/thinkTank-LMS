@@ -10,10 +10,44 @@ from models import MODELS
 logger = logging.getLogger(__name__)
 
 
-# Tortoise ORM config
+# PostgreSQL Configuration (commented out)
+"""
 TORTOISE_ORM = {
     "connections": {
         "default": str(settings.DATABASE_URL),
+    },
+    "apps": {
+        "models": {
+            "models": ["aerich.models"] + [f"models.{model.__module__.split('.')[-1]}" for model in MODELS],
+            "default_connection": "default",
+        },
+    },
+    "use_tz": True,
+    "timezone": settings.TIME_ZONE,
+}
+"""
+
+# MySQL Configuration (alternative option)
+"""
+TORTOISE_ORM = {
+    "connections": {
+        "default": f"mysql://{settings.DB_USER}:{settings.DB_PASSWORD}@{settings.DB_HOST}:{settings.DB_PORT}/{settings.DB_NAME}"
+    },
+    "apps": {
+        "models": {
+            "models": ["aerich.models"] + [f"models.{model.__module__.split('.')[-1]}" for model in MODELS],
+            "default_connection": "default",
+        },
+    },
+    "use_tz": True,
+    "timezone": settings.TIME_ZONE,
+}
+"""
+
+# SQLite Configuration (active)
+TORTOISE_ORM = {
+    "connections": {
+        "default": "sqlite://db.sqlite3"
     },
     "apps": {
         "models": {
@@ -36,7 +70,7 @@ async def init_db(create_schema: bool = False) -> None:
     logger.info("Initializing database connection")
     
     await Tortoise.init(
-        db_url=str(settings.DATABASE_URL),
+        db_url="sqlite://db.sqlite3",
         modules={"models": [model.__module__ for model in MODELS]},
     )
     
@@ -80,7 +114,7 @@ def init_app(app: FastAPI) -> None:
     """
     register_tortoise(
         app,
-        db_url=str(settings.DATABASE_URL),
+        db_url="sqlite://db.sqlite3",
         modules={"models": ["models"]},
         generate_schemas=settings.DEBUG,
         add_exception_handlers=True,
