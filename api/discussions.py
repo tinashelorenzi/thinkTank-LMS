@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query, Path, Back
 
 from models.course import Course, Section
 from models.user import User, UserRole
+from models.assignment import Assignment
 from models.enrollment import Enrollment, EnrollmentType, EnrollmentState
 from models.discussion import (
     DiscussionForum, DiscussionTopic, DiscussionReply, DiscussionReplyLike,
@@ -15,7 +16,8 @@ from models.group import Group
 from schemas.discussion import (
     DiscussionTopicCreate, DiscussionTopicUpdate, DiscussionTopicResponse, DiscussionTopicListResponse,
     DiscussionReplyCreate, DiscussionReplyUpdate, DiscussionReplyResponse, DiscussionReplyListResponse,
-    DiscussionReplyLikeCreate, DiscussionTopicSubscriptionCreate, DiscussionSubscriptionUpdate
+    DiscussionReplyLikeCreate, DiscussionTopicSubscriptionCreate, DiscussionSubscriptionUpdate,
+    DiscussionForumResponse, DiscussionForumCreate, DiscussionForumUpdate, DiscussionForumResponse,
 )
 from core.security import (
     get_current_user,
@@ -423,8 +425,8 @@ async def delete_discussion_topic(
 @router.post("/topics/{topic_id}/replies", response_model=DiscussionReplyResponse, status_code=status.HTTP_201_CREATED)
 async def create_discussion_reply(
     reply_in: DiscussionReplyCreate,
-    topic_id: int = Path(..., description="The ID of the discussion topic"),
     background_tasks: BackgroundTasks,
+    topic_id: int = Path(..., description="The ID of the discussion topic"),
     current_user: User = Depends(get_current_active_user),
 ) -> Any:
     """
@@ -800,17 +802,507 @@ async def like_discussion_reply(
     
     # Check if user already liked this reply
     existing_like = await DiscussionReplyLike.get_or_none(reply=reply, user=current_user)
-    
+
     if existing_like:
         # Remove like
         await existing_like.delete()
-        
+
         # Update like count
         reply.like_count = max(0, reply.like_count - 1)
         await reply.save()
-        
+
         return {"message": "Like removed successfully"}
     else:
         # Add like
         await DiscussionReplyLike.create(
             reply=reply,
+            user=current_user,
+        )
+
+        # Update like count
+        reply.like_count += 1
+        await reply.save()
+
+        return {"message": "Like added successfully"}
+
+@router.post("/topics/{topic_id}/endorse/{reply_id}", response_model=Dict[str, Any])
+async def endorse_discussion_reply(
+        topic_id: int = Path(..., description="The ID of the discussion topic"),
+        reply_id: int = Path(..., description="The ID of the discussion reply"),
+        current_user: User = Depends(get_current_instructor_or_admin),
+) -> Any:
+    """
+    Endorse a discussion reply (instructor or admin only)
+    """
+    # Get topic and reply
+    topic = await DiscussionTopic.get_or_none(id=topic_id)
+
+    if not topic:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Discussion topic not found",
+        )
+
+    reply = await DiscussionReply.get_or_none(id=reply_id, topic=topic)
+
+    if not reply:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Discussion reply not found",
+        )
+
+    # Update endorsement
+    reply.is_endorsed = True
+    reply.endorsed_by = current_user
+    reply.endorsed_at = datetime.utcnow()
+    await reply.save()
+
+    return {"message": "Reply endorsed successfully"}
+
+
+@router.post("/topics/{topic_id}/subscribe", response_model=Dict[str, Any])
+async def subscribe_to_topic(
+        subscription_in: DiscussionTopicSubscriptionCreate,
+        topic_id: int = Path(..., description="The ID of the discussion topic"),
+        current_user: User = Depends(get_current_active_user),
+) -> Any:
+    """
+    Subscribe to a discussion topic
+    """
+    # Get topic
+    topic = await DiscussionTopic.get_or_none(id=topic_id).prefetch_related("forum", "forum__course")
+
+    if not topic:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Discussion topic not found",
+        )
+
+    # Check if user can access this topic
+    if current_user.role != UserRole.ADMIN:
+        # Check enrollment
+        enrollment = await Enrollment.get_or_none(
+            user=current_user,
+            course=topic.forum.course,
+            state=EnrollmentState.ACTIVE,
+        )
+
+        if not enrollment:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You are not enrolled in this course",
+            )
+
+    # Check if user is already subscribed
+    existing_subscription = await DiscussionTopicSubscription.get_or_none(
+        topic=topic,
+        user=current_user,
+    )
+
+    if existing_subscription:
+        # Update subscription
+        existing_subscription.send_email = subscription_in.send_email
+        await existing_subscription.save()
+        return {"message": "Subscription updated successfully"}
+    else:
+        # Create subscription
+        await DiscussionTopicSubscription.create(
+            topic=topic,
+            user=current_user,
+            send_email=subscription_in.send_email,
+        )
+        return {"message": "Subscribed to topic successfully"}
+
+
+@router.delete("/topics/{topic_id}/unsubscribe", response_model=Dict[str, Any])
+async def unsubscribe_from_topic(
+        topic_id: int = Path(..., description="The ID of the discussion topic"),
+        current_user: User = Depends(get_current_active_user),
+) -> Any:
+    """
+    Unsubscribe from a discussion topic
+    """
+    # Get topic
+    topic = await DiscussionTopic.get_or_none(id=topic_id)
+
+    if not topic:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Discussion topic not found",
+        )
+
+    # Get subscription
+    subscription = await DiscussionTopicSubscription.get_or_none(
+        topic=topic,
+        user=current_user,
+    )
+
+    if not subscription:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="You are not subscribed to this topic",
+        )
+
+    # Delete subscription
+    await subscription.delete()
+
+    return {"message": "Unsubscribed from topic successfully"}
+
+
+@router.put("/topics/{topic_id}/close", response_model=DiscussionTopicResponse)
+async def close_discussion_topic(
+        topic_id: int = Path(..., description="The ID of the discussion topic"),
+        current_user: User = Depends(get_current_instructor_or_admin),
+) -> Any:
+    """
+    Close a discussion topic for further replies (instructor or admin only)
+    """
+    # Get topic
+    topic = await DiscussionTopic.get_or_none(id=topic_id).prefetch_related("forum", "forum__course")
+
+    if not topic:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Discussion topic not found",
+        )
+
+    # Check if user has permission to close this topic
+    if current_user.role != UserRole.ADMIN:
+        # Check if user is instructor of the course
+        is_instructor = await Enrollment.filter(
+            user=current_user,
+            course=topic.forum.course,
+            type=EnrollmentType.TEACHER,
+            state=EnrollmentState.ACTIVE,
+        ).exists()
+
+        if not is_instructor and topic.author_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You don't have permission to close this topic",
+            )
+
+    # Close topic
+    topic.is_closed = True
+    await topic.save()
+
+    return topic
+
+
+@router.put("/topics/{topic_id}/reopen", response_model=DiscussionTopicResponse)
+async def reopen_discussion_topic(
+        topic_id: int = Path(..., description="The ID of the discussion topic"),
+        current_user: User = Depends(get_current_instructor_or_admin),
+) -> Any:
+    """
+    Reopen a closed discussion topic (instructor or admin only)
+    """
+    # Get topic
+    topic = await DiscussionTopic.get_or_none(id=topic_id).prefetch_related("forum", "forum__course")
+
+    if not topic:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Discussion topic not found",
+        )
+
+    # Check if user has permission to reopen this topic
+    if current_user.role != UserRole.ADMIN:
+        # Check if user is instructor of the course
+        is_instructor = await Enrollment.filter(
+            user=current_user,
+            course=topic.forum.course,
+            type=EnrollmentType.TEACHER,
+            state=EnrollmentState.ACTIVE,
+        ).exists()
+
+        if not is_instructor and topic.author_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You don't have permission to reopen this topic",
+            )
+
+    # Reopen topic
+    topic.is_closed = False
+    await topic.save()
+
+    return topic
+
+
+@router.post("/forums", response_model=DiscussionForumResponse, status_code=status.HTTP_201_CREATED)
+async def create_discussion_forum(
+        forum_in: DiscussionForumCreate,
+        current_user: User = Depends(get_current_instructor_or_admin),
+) -> Any:
+    """
+    Create new discussion forum (instructor or admin only)
+    """
+    # Get course
+    course = await Course.get_or_none(id=forum_in.course_id)
+
+    if not course:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Course not found",
+        )
+
+    # Check if user has permission to create forums for this course
+    if current_user.role != UserRole.ADMIN:
+        # Check if user is instructor of the course
+        is_instructor = await Enrollment.filter(
+            user=current_user,
+            course=course,
+            type=EnrollmentType.TEACHER,
+            state=EnrollmentState.ACTIVE,
+        ).exists()
+
+        if not is_instructor:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You don't have permission to create forums for this course",
+            )
+
+    # Check if module exists (if provided)
+    module = None
+    if forum_in.module_id:
+        module = await Module.get_or_none(id=forum_in.module_id, course=course)
+
+        if not module:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Module not found",
+            )
+
+    # Check if assignment exists (if provided)
+    assignment = None
+    if forum_in.assignment_id:
+        assignment = await Assignment.get_or_none(id=forum_in.assignment_id, course=course)
+
+        if not assignment:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Assignment not found",
+            )
+
+    # Create forum
+    forum = await DiscussionForum.create(
+        title=forum_in.title,
+        description=forum_in.description,
+        course=course,
+        module=module,
+        assignment=assignment,
+        is_pinned=forum_in.is_pinned,
+        position=forum_in.position,
+        allow_anonymous_posts=forum_in.allow_anonymous_posts,
+        require_initial_post=forum_in.require_initial_post,
+    )
+
+    return forum
+
+
+@router.get("/forums", response_model=List[DiscussionForumResponse])
+async def list_discussion_forums(
+        course_id: Optional[int] = Query(None, description="Filter by course ID"),
+        module_id: Optional[int] = Query(None, description="Filter by module ID"),
+        current_user: User = Depends(get_current_active_user),
+) -> Any:
+    """
+    List discussion forums
+    """
+    # Create base query
+    query = DiscussionForum.all()
+
+    # Apply course filter
+    if course_id:
+        query = query.filter(course_id=course_id)
+
+        # Check if user can access this course
+        if current_user.role != UserRole.ADMIN:
+            # Check if user is enrolled in the course
+            enrollment = await Enrollment.get_or_none(
+                user=current_user,
+                course_id=course_id,
+                state=EnrollmentState.ACTIVE,
+            )
+
+            if not enrollment:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You are not enrolled in this course",
+                )
+
+    # Apply module filter
+    if module_id:
+        query = query.filter(module_id=module_id)
+
+    # Order by position and created date
+    query = query.order_by("position", "-is_pinned", "created_at")
+
+    # Get all forums
+    forums = await query.prefetch_related("course", "module", "assignment").all()
+
+    # Add topic and reply counts
+    for forum in forums:
+        forum.topic_count = await DiscussionTopic.filter(forum=forum).count()
+        forum.reply_count = await DiscussionReply.filter(topic__forum=forum).count()
+
+    return forums
+
+
+@router.get("/forums/{forum_id}", response_model=DiscussionForumResponse)
+async def get_discussion_forum(
+        forum_id: int = Path(..., description="The ID of the discussion forum"),
+        current_user: User = Depends(get_current_active_user),
+) -> Any:
+    """
+    Get discussion forum by ID
+    """
+    # Get forum
+    forum = await DiscussionForum.get_or_none(id=forum_id).prefetch_related("course", "module", "assignment")
+
+    if not forum:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Discussion forum not found",
+        )
+
+    # Check if user can access this forum
+    if current_user.role != UserRole.ADMIN:
+        # Check if user is enrolled in the course
+        enrollment = await Enrollment.get_or_none(
+            user=current_user,
+            course=forum.course,
+            state=EnrollmentState.ACTIVE,
+        )
+
+        if not enrollment:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You don't have access to this forum",
+            )
+
+    # Get topic and reply counts
+    forum.topic_count = await DiscussionTopic.filter(forum=forum).count()
+    forum.reply_count = await DiscussionReply.filter(topic__forum=forum).count()
+
+    return forum
+
+
+@router.put("/forums/{forum_id}", response_model=DiscussionForumResponse)
+async def update_discussion_forum(
+        forum_in: DiscussionForumUpdate,
+        forum_id: int = Path(..., description="The ID of the discussion forum"),
+        current_user: User = Depends(get_current_instructor_or_admin),
+) -> Any:
+    """
+    Update discussion forum (instructor or admin only)
+    """
+    # Get forum
+    forum = await DiscussionForum.get_or_none(id=forum_id).prefetch_related("course")
+
+    if not forum:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Discussion forum not found",
+        )
+
+    # Check if user has permission to update this forum
+    if current_user.role != UserRole.ADMIN:
+        # Check if user is instructor of the course
+        is_instructor = await Enrollment.filter(
+            user=current_user,
+            course=forum.course,
+            type=EnrollmentType.TEACHER,
+            state=EnrollmentState.ACTIVE,
+        ).exists()
+
+        if not is_instructor:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You don't have permission to update this forum",
+            )
+
+    # Check if module exists (if provided)
+    if forum_in.module_id:
+        module = await Module.get_or_none(id=forum_in.module_id, course=forum.course)
+
+        if not module:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Module not found",
+            )
+
+        forum.module = module
+
+    # Check if assignment exists (if provided)
+    if forum_in.assignment_id:
+        assignment = await Assignment.get_or_none(id=forum_in.assignment_id, course=forum.course)
+
+        if not assignment:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Assignment not found",
+            )
+
+        forum.assignment = assignment
+
+    # Update fields
+    for field, value in forum_in.dict(exclude_unset=True, exclude={"module_id", "assignment_id"}).items():
+        setattr(forum, field, value)
+
+    # Save forum
+    await forum.save()
+
+    # Get topic and reply counts
+    forum.topic_count = await DiscussionTopic.filter(forum=forum).count()
+    forum.reply_count = await DiscussionReply.filter(topic__forum=forum).count()
+
+    return forum
+
+
+@router.delete("/forums/{forum_id}", response_model=Dict[str, Any])
+async def delete_discussion_forum(
+        forum_id: int = Path(..., description="The ID of the discussion forum"),
+        current_user: User = Depends(get_current_instructor_or_admin),
+) -> Any:
+    """
+    Delete discussion forum (instructor or admin only)
+    """
+    # Get forum
+    forum = await DiscussionForum.get_or_none(id=forum_id).prefetch_related("course")
+
+    if not forum:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Discussion forum not found",
+        )
+
+    # Check if user has permission to delete this forum
+    if current_user.role != UserRole.ADMIN:
+        # Check if user is instructor of the course
+        is_instructor = await Enrollment.filter(
+            user=current_user,
+            course=forum.course,
+            type=EnrollmentType.TEACHER,
+            state=EnrollmentState.ACTIVE,
+        ).exists()
+
+        if not is_instructor:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You don't have permission to delete this forum",
+            )
+
+    # Check if forum has topics
+    has_topics = await DiscussionTopic.filter(forum=forum).exists()
+
+    if has_topics:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot delete forum with existing topics",
+        )
+
+    # Delete forum
+    await forum.delete()
+
+    return {"message": "Discussion forum deleted successfully"}
