@@ -994,4 +994,599 @@ async def grade_quiz_attempt(quiz: Quiz, attempt: QuizAttempt) -> None:
                     score = question_points
                 elif question.is_partial_credit:
                     # Calculate partial credit
-                    correct_selected = len(correct_ids.intersection(selecte
+                    correct_selected = len(correct_ids.intersection(selected_ids))
+                    incorrect_selected = len(selected_ids - correct_ids)
+                    total_correct = len(correct_ids)
+                    total_possible_incorrect = len(await QuestionAnswer.filter(question=question).all()) - total_correct
+
+                    # Calculate score percentage
+                    correct_ratio = correct_selected / total_correct if total_correct > 0 else 0
+                    incorrect_penalty = incorrect_selected / total_possible_incorrect if total_possible_incorrect > 0 else 0
+                    score_percent = max(0, correct_ratio - incorrect_penalty)
+
+                    score = question_points * score_percent
+                    is_correct = score > 0
+                elif question.question_type == QuestionType.TRUE_FALSE:
+                    correct_answer = await QuestionAnswer.get_or_none(question=question, is_correct=True)
+                    selected_answers = await response.selected_answers.all()
+                    if correct_answer and selected_answers and correct_answer.id == selected_answers[0].id:
+                        is_correct = True
+                        score = question_points
+                    elif question.question_type == QuestionType.NUMERICAL:
+                        if response.numerical_response is not None and question.numerical_answer is not None:
+                            # Check within tolerance
+                            tolerance = question.numerical_tolerance or 0
+                            if abs(response.numerical_response - question.numerical_answer) <= tolerance:
+                                is_correct = True
+                                score = question_points
+
+                    elif question.question_type == QuestionType.MATCHING:
+                        # Check matching answers
+                        if response.matching_response and question.matching_pairs:
+                            # Convert matching_pairs to a dict for easier comparison
+                            correct_matches = {}
+                            for pair in question.matching_pairs:
+                                correct_matches[pair["left"]] = pair["right"]
+
+                            # Count correct matches
+                            correct_count = 0
+                            for left, right in response.matching_response.items():
+                                if left in correct_matches and correct_matches[left] == right:
+                                    correct_count += 1
+                            # Calculate score
+                            if correct_count == len(correct_matches):
+                                is_correct = True
+                                score = question_points
+                            elif question.is_partial_credit:
+                                # Partial credit based on correct matches
+                                score_percent = correct_count / len(correct_matches)
+                                score = question_points * score_percent
+                                is_correct = score > 0
+                    elif question.question_type == QuestionType.ORDERING:
+                        # Check ordering
+                        if response.ordering_response and question.correct_order:
+                            if response.ordering_response == question.correct_order:
+                                is_correct = True
+                                score = question_points
+                            elif question.is_partial_credit:
+                                # Calculate longest common subsequence as partial credit
+                                lcs_length = longest_common_subsequence(response.ordering_response, question.correct_order)
+                                score_percent = lcs_length / len(question.correct_order)
+                                score = question_points * score_percent
+                                is_correct = score > 0
+
+                    elif question.question_type == QuestionType.FILL_IN_BLANK:
+                        # Check text response against correct answers
+                        if response.text_response:
+                            # Get all correct answers
+                            correct_answers = await QuestionAnswer.filter(question=question, is_correct=True).all()
+
+                            # Check if response matches any correct answer
+                            for answer in correct_answers:
+                                if response.text_response.strip().lower() == answer.text.strip().lower():
+                                    is_correct = True
+                                    score = question_points
+                                    break
+
+                    elif question.question_type == QuestionType.SHORT_ANSWER:
+                        # Similar to fill in blank but with more flexibility
+                        if response.text_response:
+                            # Get all correct answers
+                            correct_answers = await QuestionAnswer.filter(question=question, is_correct=True).all()
+
+                            # Check if response contains any correct answer as substring
+                            for answer in correct_answers:
+                                if answer.text.strip().lower() in response.text_response.strip().lower():
+                                    is_correct = True
+                                    score = question_points
+                                    break
+
+                    # Update response with score and feedback
+                    response.score = score
+                    response.is_correct = is_correct
+
+                    # Add feedback based on correctness
+                    if question.feedback:
+                        response.feedback = question.feedback
+
+                    await response.save()
+
+                    # Add to total
+                    earned_points += score
+                    graded_count += 1
+
+                # Update attempt with score if all questions are graded
+                if graded_count > 0:
+                    attempt.score = earned_points / total_points * 100 if total_points > 0 else 0
+                    attempt.is_graded = True
+                    await attempt.save()
+
+# Helper function for calculating longest common subsequence
+def longest_common_subsequence(seq1, seq2):
+    """Calculate the length of the longest common subsequence of two sequences"""
+    m, n = len(seq1), len(seq2)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if seq1[i-1] == seq2[j-1]:
+                dp[i][j] = dp[i-1][j-1] + 1
+            else:
+                dp[i][j] = max(dp[i-1][j], dp[i][j-1])
+
+    return dp[m][n]
+
+
+@router.get("/{quiz_id}/attempts", response_model=List[QuizAttemptResponse])
+async def list_quiz_attempts(
+        quiz_id: int = Path(..., description="The ID of the quiz"),
+        user_id: Optional[int] = Query(None, description="Filter by user ID"),
+        current_user: User = Depends(get_current_active_user),
+) -> Any:
+    """
+    List attempts for a quiz
+    """
+    # Get quiz
+    quiz = await Quiz.get_or_none(id=quiz_id).prefetch_related("course")
+
+    if not quiz:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Quiz not found",
+        )
+
+    # Check if user can access this quiz
+    if current_user.role != UserRole.ADMIN:
+        # Check enrollment
+        enrollment = await Enrollment.get_or_none(
+            user=current_user,
+            course=quiz.course,
+            state=EnrollmentState.ACTIVE,
+        )
+
+        if not enrollment:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You are not enrolled in this course",
+            )
+
+    # Create base query
+    query = QuizAttempt.filter(quiz=quiz)
+
+    # Filter by user
+    # Instructors can view all attempts, students can only view their own
+    if current_user.role == UserRole.ADMIN:
+        if user_id:
+            query = query.filter(user_id=user_id)
+    elif current_user.role == UserRole.INSTRUCTOR:
+        # Check if user is instructor of the course
+        is_instructor = await Enrollment.filter(
+            user=current_user,
+            course=quiz.course,
+            type=EnrollmentType.TEACHER,
+            state=EnrollmentState.ACTIVE,
+        ).exists()
+
+        if is_instructor:
+            if user_id:
+                query = query.filter(user_id=user_id)
+        else:
+            # If not instructor, can only see own attempts
+            query = query.filter(user=current_user)
+    else:
+        # Students can only view their own attempts
+        query = query.filter(user=current_user)
+
+    # Get attempts ordered by latest first
+    attempts = await query.order_by("-created_at").prefetch_related("user").all()
+
+    # Format response
+    result = []
+    for attempt in attempts:
+        # Get responses for the attempt
+        responses = await QuizResponse.filter(attempt=attempt).prefetch_related("question").all()
+
+        result.append({
+            "id": attempt.id,
+            "quiz_id": quiz.id,
+            "user_id": attempt.user.id,
+            "attempt_number": attempt.attempt_number,
+            "score": attempt.score,
+            "started_at": attempt.created_at,
+            "submitted_at": attempt.submitted_at,
+            "time_spent_seconds": attempt.time_spent_seconds,
+            "is_completed": attempt.is_completed,
+            "is_graded": attempt.is_graded,
+            "responses": responses,
+        })
+
+    return result
+
+
+@router.get("/{quiz_id}/attempts/{attempt_id}", response_model=QuizAttemptResponse)
+async def get_quiz_attempt(
+        quiz_id: int = Path(..., description="The ID of the quiz"),
+        attempt_id: int = Path(..., description="The ID of the attempt"),
+        current_user: User = Depends(get_current_active_user),
+) -> Any:
+    """
+    Get a specific quiz attempt
+    """
+    # Get quiz and attempt
+    quiz = await Quiz.get_or_none(id=quiz_id)
+
+    if not quiz:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Quiz not found",
+        )
+
+    attempt = await QuizAttempt.get_or_none(id=attempt_id, quiz=quiz).prefetch_related("user")
+
+    if not attempt:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Quiz attempt not found",
+        )
+
+    # Check if user has permission to view this attempt
+    if current_user.role != UserRole.ADMIN:
+        # Users can view their own attempts
+        if attempt.user_id != current_user.id:
+            # Check if user is instructor of the course
+            is_instructor = await Enrollment.filter(
+                user=current_user,
+                course=quiz.course,
+                type=EnrollmentType.TEACHER,
+                state=EnrollmentState.ACTIVE,
+            ).exists()
+
+            if not is_instructor:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You do not have permission to view this attempt",
+                )
+
+    # Get responses for the attempt
+    responses = await QuizResponse.filter(attempt=attempt).prefetch_related("question").all()
+
+    # Show correct answers and feedback only if appropriate
+    show_answers = False
+
+    if current_user.role == UserRole.ADMIN or current_user.role == UserRole.INSTRUCTOR:
+        show_answers = True
+    elif attempt.is_completed:
+        # Check quiz settings for showing correct answers
+        if quiz.show_correct_answers:
+            # Check time restrictions
+            now = datetime.utcnow()
+
+            if (quiz.show_correct_answers_at is None or now >= quiz.show_correct_answers_at) and \
+                    (quiz.hide_correct_answers_at is None or now <= quiz.hide_correct_answers_at):
+                show_answers = True
+
+    # Format responses based on permissions
+    for response in responses:
+        if not show_answers:
+            # Hide correct/incorrect status and feedback
+            response.is_correct = None
+            response.feedback = None
+
+    return {
+        "id": attempt.id,
+        "quiz_id": quiz.id,
+        "user_id": attempt.user.id,
+        "attempt_number": attempt.attempt_number,
+        "score": attempt.score,
+        "started_at": attempt.created_at,
+        "submitted_at": attempt.submitted_at,
+        "time_spent_seconds": attempt.time_spent_seconds,
+        "is_completed": attempt.is_completed,
+        "is_graded": attempt.is_graded,
+        "responses": responses,
+    }
+
+
+@router.post("/questions/{question_id}/answers", response_model=Dict[str, Any])
+async def add_question_answer(
+        question_id: int = Path(..., description="The ID of the question"),
+        text: str = Query(..., description="Answer text"),
+        is_correct: bool = Query(False, description="Whether this answer is correct"),
+        weight: float = Query(100.0, description="Weight for partial credit"),
+        feedback: Optional[str] = Query(None, description="Feedback for this answer"),
+        match_id: Optional[str] = Query(None, description="ID for matching questions"),
+        order_position: Optional[int] = Query(None, description="Position for ordering questions"),
+        current_user: User = Depends(get_current_instructor_or_admin),
+) -> Any:
+    """
+    Add an answer to a question (instructor or admin only)
+    """
+    # Get question
+    question = await Question.get_or_none(id=question_id)
+
+    if not question:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Question not found",
+        )
+
+    # Create answer
+    answer = await QuestionAnswer.create(
+        text=text,
+        question=question,
+        is_correct=is_correct,
+        weight=weight,
+        feedback=feedback,
+        match_id=match_id,
+        order_position=order_position,
+    )
+
+    return {
+        "id": answer.id,
+        "text": answer.text,
+        "is_correct": answer.is_correct,
+        "weight": answer.weight,
+        "feedback": answer.feedback,
+        "match_id": answer.match_id,
+        "order_position": answer.order_position,
+    }
+
+
+@router.delete("/questions/answers/{answer_id}", response_model=Dict[str, Any])
+async def delete_question_answer(
+        answer_id: int = Path(..., description="The ID of the answer"),
+        current_user: User = Depends(get_current_instructor_or_admin),
+) -> Any:
+    """
+    Delete an answer from a question (instructor or admin only)
+    """
+    # Get answer
+    answer = await QuestionAnswer.get_or_none(id=answer_id).prefetch_related("question")
+
+    if not answer:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Answer not found",
+        )
+
+    # Delete answer
+    await answer.delete()
+
+    return {"message": "Answer deleted successfully"}
+
+
+@router.post("/{quiz_id}/questions", response_model=Dict[str, Any])
+async def add_question_to_quiz(
+        quiz_id: int = Path(..., description="The ID of the quiz"),
+        question_id: int = Query(..., description="ID of the question to add"),
+        position: Optional[int] = Query(None, description="Position in the quiz"),
+        points: Optional[float] = Query(None, description="Points for this question in the quiz"),
+        question_group_id: Optional[int] = Query(None, description="ID of question group (if any)"),
+        current_user: User = Depends(get_current_instructor_or_admin),
+) -> Any:
+    """
+    Add an existing question to a quiz (instructor or admin only)
+    """
+    # Get quiz
+    quiz = await Quiz.get_or_none(id=quiz_id).prefetch_related("course")
+
+    if not quiz:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Quiz not found",
+        )
+
+    # Check if user has permission to modify this quiz
+    if current_user.role != UserRole.ADMIN:
+        # Check if user is instructor of the course
+        is_instructor = await Enrollment.filter(
+            user=current_user,
+            course=quiz.course,
+            type=EnrollmentType.TEACHER,
+            state=EnrollmentState.ACTIVE,
+        ).exists()
+
+        if not is_instructor:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to modify this quiz",
+            )
+
+    # Get question
+    question = await Question.get_or_none(id=question_id)
+
+    if not question:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Question not found",
+        )
+
+    # Get question group if specified
+    question_group = None
+    if question_group_id:
+        question_group = await QuizQuestionGroup.get_or_none(id=question_group_id, quiz=quiz)
+
+        if not question_group:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Question group not found",
+            )
+
+    # Check if question is already in the quiz
+    existing_question = await QuizQuestion.get_or_none(
+        quiz=quiz,
+        question=question,
+    )
+
+    if existing_question:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Question is already in this quiz",
+        )
+
+    # Determine position if not provided
+    if position is None:
+        if question_group:
+            # Get max position in group
+            max_position_result = await QuizQuestion.filter(
+                quiz=quiz,
+                question_group=question_group
+            ).order_by("-position").first()
+
+            position = (max_position_result.position + 1) if max_position_result else 0
+        else:
+            # Get max position in quiz
+            max_position_result = await QuizQuestion.filter(
+                quiz=quiz,
+                question_group=None
+            ).order_by("-position").first()
+
+            position = (max_position_result.position + 1) if max_position_result else 0
+
+    # Create quiz question
+    quiz_question = await QuizQuestion.create(
+        quiz=quiz,
+        question=question,
+        position=position,
+        points=points,
+        question_group=question_group,
+    )
+
+    # Update quiz stats
+    quiz.question_count += 1
+    quiz.points_possible += points or question.points
+    await quiz.save()
+
+    return {
+        "id": quiz_question.id,
+        "quiz_id": quiz.id,
+        "question_id": question.id,
+        "position": quiz_question.position,
+        "points": quiz_question.points,
+        "question_group_id": question_group_id,
+    }
+
+
+@router.delete("/{quiz_id}/questions/{quiz_question_id}", response_model=Dict[str, Any])
+async def remove_question_from_quiz(
+        quiz_id: int = Path(..., description="The ID of the quiz"),
+        quiz_question_id: int = Path(..., description="The ID of the quiz question"),
+        current_user: User = Depends(get_current_instructor_or_admin),
+) -> Any:
+    """
+    Remove a question from a quiz (instructor or admin only)
+    """
+    # Get quiz
+    quiz = await Quiz.get_or_none(id=quiz_id).prefetch_related("course")
+
+    if not quiz:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Quiz not found",
+        )
+
+    # Check if user has permission to modify this quiz
+    if current_user.role != UserRole.ADMIN:
+        # Check if user is instructor of the course
+        is_instructor = await Enrollment.filter(
+            user=current_user,
+            course=quiz.course,
+            type=EnrollmentType.TEACHER,
+            state=EnrollmentState.ACTIVE,
+        ).exists()
+
+        if not is_instructor:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to modify this quiz",
+            )
+
+    # Get quiz question
+    quiz_question = await QuizQuestion.get_or_none(id=quiz_question_id, quiz=quiz).prefetch_related("question")
+
+    if not quiz_question:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Question not found in this quiz",
+        )
+
+    # Update quiz stats
+    question_points = quiz_question.points or quiz_question.question.points
+    quiz.question_count = max(0, quiz.question_count - 1)
+    quiz.points_possible = max(0, quiz.points_possible - question_points)
+    await quiz.save()
+
+    # Delete quiz question
+    await quiz_question.delete()
+
+    return {"message": "Question removed from quiz successfully"}
+
+
+@router.post("/{quiz_id}/question-groups", response_model=Dict[str, Any])
+async def create_question_group(
+        quiz_id: int = Path(..., description="The ID of the quiz"),
+        title: Optional[str] = Query(None, description="Group title"),
+        position: int = Query(0, description="Position in the quiz"),
+        pick_count: int = Query(1, description="Number of questions to pick from the group"),
+        points_per_question: Optional[float] = Query(None, description="Points per question in the group"),
+        question_bank_id: Optional[int] = Query(None, description="Question bank to pull questions from"),
+        current_user: User = Depends(get_current_instructor_or_admin),
+) -> Any:
+    """
+    Create a question group in a quiz (instructor or admin only)
+    """
+    # Get quiz
+    quiz = await Quiz.get_or_none(id=quiz_id).prefetch_related("course")
+
+    if not quiz:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Quiz not found",
+        )
+
+    # Check if user has permission to modify this quiz
+    if current_user.role != UserRole.ADMIN:
+        # Check if user is instructor of the course
+        is_instructor = await Enrollment.filter(
+            user=current_user,
+            course=quiz.course,
+            type=EnrollmentType.TEACHER,
+            state=EnrollmentState.ACTIVE,
+        ).exists()
+
+        if not is_instructor:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to modify this quiz",
+            )
+
+    # Check question bank if specified
+    if question_bank_id:
+        question_bank = await QuestionBank.get_or_none(id=question_bank_id)
+
+        if not question_bank:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Question bank not found",
+            )
+
+    # Create question group
+    group = await QuizQuestionGroup.create(
+        quiz=quiz,
+        title=title,
+        position=position,
+        pick_count=pick_count,
+        points_per_question=points_per_question,
+        question_bank_id=question_bank_id,
+    )
+
+    return {
+        "id": group.id,
+        "quiz_id": quiz.id,
+        "title": group.title,
+        "position": group.position,
+        "pick_count": group.pick_count,
+        "points_per_question": group.points_per_question,
+        "question_bank_id": group.question_bank_id,
+    }
+
