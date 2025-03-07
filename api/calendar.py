@@ -870,3 +870,270 @@ async def delete_reminder(
 ) -> Any:
     """
     Delete an event reminder
+    """
+    # Get reminder
+    reminder = await EventReminder.get_or_none(id=reminder_id).prefetch_related("user")
+
+    if not reminder:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Reminder not found",
+        )
+
+    # Check if user owns this reminder
+    if current_user.role != UserRole.ADMIN and reminder.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to delete this reminder",
+        )
+
+    # Delete reminder
+    await reminder.delete()
+
+    return {"message": "Reminder deleted successfully"}
+
+
+@router.post("/events/date-range", response_model=List[CalendarEventResponse])
+async def get_events_in_date_range(
+        request: CalendarEventsDateRangeRequest,
+        current_user: User = Depends(get_current_active_user),
+) -> Any:
+    """
+    Get events within a specific date range
+    """
+    # Create base query
+    query = CalendarEvent.filter(
+        # Events that start within the range
+        (CalendarEvent.start_time >= request.start_date) &
+        (CalendarEvent.start_time <= request.end_date)
+    ) | CalendarEvent.filter(
+        # Events that end within the range
+        (CalendarEvent.end_time >= request.start_date) &
+        (CalendarEvent.end_time <= request.end_date)
+    ) | CalendarEvent.filter(
+        # Events that span the entire range
+        (CalendarEvent.start_time <= request.start_date) &
+        (CalendarEvent.end_time >= request.end_date)
+    )
+
+    # Apply course filter
+    if request.course_ids:
+        query = query.filter(course_id__in=request.course_ids)
+
+        # Check if user has access to these courses
+        if current_user.role != UserRole.ADMIN:
+            for course_id in request.course_ids:
+                enrollment = await Enrollment.get_or_none(
+                    user=current_user,
+                    course_id=course_id,
+                    state=EnrollmentState.ACTIVE,
+                )
+
+                if not enrollment:
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail=f"You do not have access to course with ID {course_id}",
+                    )
+
+    # Apply user filter
+    if request.user_id:
+        query = query.filter(user_id=request.user_id)
+
+        # Users can only see their own events unless admin
+        if current_user.role != UserRole.ADMIN and request.user_id != current_user.id:
+            # Allow if events are public
+            query = query.filter(is_public=True)
+
+    # Filter by event types
+    type_filters = []
+
+    if request.include_assignments:
+        type_filters.append(EventType.ASSIGNMENT)
+
+    if request.include_course_events:
+        type_filters.extend([EventType.COURSE, EventType.LECTURE, EventType.OFFICE_HOURS])
+
+    if request.include_user_events:
+        type_filters.extend([EventType.PERSONAL, EventType.MEETING, EventType.OTHER])
+
+    if type_filters:
+        query = query.filter(event_type__in=type_filters)
+
+    # Filter to events the user can see
+    if current_user.role != UserRole.ADMIN:
+        # User can see:
+        # 1. Events they created
+        # 2. Events where they are an attendee
+        # 3. Public events
+        # 4. Course events for courses they're enrolled in
+        query = query.filter(
+            # Events created by user
+            (CalendarEvent.user == current_user) |
+            # Events where user is an attendee
+            (CalendarEvent.attendees.user == current_user) |
+            # Public events
+            (CalendarEvent.is_public == True) |
+            # Course events for enrolled courses
+            (CalendarEvent.course_id.in_(
+                Enrollment.filter(
+                    user=current_user,
+                    state=EnrollmentState.ACTIVE
+                ).values_list("course_id", flat=True)
+            ))
+        )
+
+    # Get events
+    events = await query.prefetch_related(
+        "course", "user", "section", "assignment", "attendees", "attendees__user"
+    ).all()
+
+    # Process recurring events
+    expanded_events = []
+    for event in events:
+        if event.recurrence_type == RecurrenceType.NONE:
+            expanded_events.append(event)
+        else:
+            # Add original event
+            expanded_events.append(event)
+
+            # Add recurrence instances
+            # Simple implementation for daily, weekly, monthly recurrence
+            if event.recurrence_end_date and event.recurrence_end_date > request.end_date:
+                recurrence_end = request.end_date
+            else:
+                recurrence_end = event.recurrence_end_date or request.end_date
+
+            # Handle different recurrence types
+            if event.recurrence_type == RecurrenceType.DAILY:
+                # Generate daily events
+                current_date = event.start_time + timedelta(days=1)  # Start from next day
+                while current_date.date() <= recurrence_end.date():
+                    # Create copy of event with updated dates
+                    duration = event.end_time - event.start_time
+                    expanded_events.append({
+                        **event.__dict__,
+                        "id": f"{event.id}_r_{current_date.strftime('%Y%m%d')}",
+                        "start_time": current_date,
+                        "end_time": current_date + duration,
+                        "is_recurring_instance": True,
+                    })
+                    current_date += timedelta(days=1)
+
+            elif event.recurrence_type == RecurrenceType.WEEKLY:
+                # Generate weekly events
+                current_date = event.start_time + timedelta(days=7)  # Start from next week
+                while current_date.date() <= recurrence_end.date():
+                    # Create copy of event with updated dates
+                    duration = event.end_time - event.start_time
+                    expanded_events.append({
+                        **event.__dict__,
+                        "id": f"{event.id}_r_{current_date.strftime('%Y%m%d')}",
+                        "start_time": current_date,
+                        "end_time": current_date + duration,
+                        "is_recurring_instance": True,
+                    })
+                    current_date += timedelta(days=7)
+
+            elif event.recurrence_type == RecurrenceType.BIWEEKLY:
+                # Generate biweekly events
+                current_date = event.start_time + timedelta(days=14)  # Start from two weeks later
+                while current_date.date() <= recurrence_end.date():
+                    # Create copy of event with updated dates
+                    duration = event.end_time - event.start_time
+                    expanded_events.append({
+                        **event.__dict__,
+                        "id": f"{event.id}_r_{current_date.strftime('%Y%m%d')}",
+                        "start_time": current_date,
+                        "end_time": current_date + duration,
+                        "is_recurring_instance": True,
+                    })
+                    current_date += timedelta(days=14)
+
+            elif event.recurrence_type == RecurrenceType.MONTHLY:
+                # Generate monthly events
+                start_day = event.start_time.day
+                current_month = event.start_time.month + 1
+                current_year = event.start_time.year
+
+                while True:
+                    # Handle year rollover
+                    if current_month > 12:
+                        current_month = 1
+                        current_year += 1
+
+                    # Try to create same day in next month
+                    try:
+                        current_date = datetime(
+                            year=current_year,
+                            month=current_month,
+                            day=start_day,
+                            hour=event.start_time.hour,
+                            minute=event.start_time.minute,
+                            second=event.start_time.second,
+                        )
+                    except ValueError:
+                        # Handle months with fewer days (e.g., Feb 30)
+                        # Just skip this recurrence
+                        current_month += 1
+                        continue
+
+                    if current_date.date() > recurrence_end.date():
+                        break
+
+                    # Create copy of event with updated dates
+                    duration = event.end_time - event.start_time
+                    expanded_events.append({
+                        **event.__dict__,
+                        "id": f"{event.id}_r_{current_date.strftime('%Y%m%d')}",
+                        "start_time": current_date,
+                        "end_time": current_date + duration,
+                        "is_recurring_instance": True,
+                    })
+
+                    current_month += 1
+
+            elif event.recurrence_type == RecurrenceType.YEARLY:
+                # Generate yearly events
+                start_month = event.start_time.month
+                start_day = event.start_time.day
+                current_year = event.start_time.year + 1
+
+                while True:
+                    # Try to create same day in next year
+                    try:
+                        current_date = datetime(
+                            year=current_year,
+                            month=start_month,
+                            day=start_day,
+                            hour=event.start_time.hour,
+                            minute=event.start_time.minute,
+                            second=event.start_time.second,
+                        )
+                    except ValueError:
+                        # Handle Feb 29 in non-leap years
+                        # Just skip this recurrence
+                        current_year += 1
+                        continue
+
+                    if current_date.date() > recurrence_end.date():
+                        break
+
+                    # Create copy of event with updated dates
+                    duration = event.end_time - event.start_time
+                    expanded_events.append({
+                        **event.__dict__,
+                        "id": f"{event.id}_r_{current_date.strftime('%Y%m%d')}",
+                        "start_time": current_date,
+                        "end_time": current_date + duration,
+                        "is_recurring_instance": True,
+                    })
+
+                    current_year += 1
+
+            elif event.recurrence_type == RecurrenceType.CUSTOM and event.recurrence_rule:
+                # For custom recurrence, we'd need a more complex parser for RRULE
+                # This would typically use a library like dateutil.rrule
+                # Simplified implementation just adds a note
+                expanded_events[-1]["custom_recurrence_note"] = "Custom recurrence pattern - see event details"
+
+    return expanded_events
