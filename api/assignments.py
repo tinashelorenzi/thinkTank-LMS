@@ -260,8 +260,8 @@ async def get_assignment(
 @router.put("/{assignment_id}", response_model=AssignmentResponse)
 async def update_assignment(
     assignment_in: AssignmentUpdate,
-    assignment_id: int = Path(..., description="The ID of the assignment"),
     background_tasks: BackgroundTasks,
+    assignment_id: int = Path(..., description="The ID of the assignment"),
     current_user: User = Depends(get_current_instructor_or_admin),
 ) -> Any:
     """
