@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query, Path, Uplo
 from fastapi.responses import StreamingResponse
 
 from models.course import Course
-from models.user import User, UserRole
+from models.users import User, UserRole
 from models.enrollment import Enrollment, EnrollmentType, EnrollmentState
 from models.file import (
     File as FileModel, Folder, FileFolder, FileVersion, FilePermission,

@@ -2,7 +2,7 @@ from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 
-from models.user import User, UserRole
+from models.users import User, UserRole
 from schemas.user import UserResponse, UserUpdate, UserUpdatePassword, UserListResponse
 from core.security import (
     get_current_user, 

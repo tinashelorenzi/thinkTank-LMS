@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Path, BackgroundTasks
 
 from models.course import Course
-from models.user import User, UserRole
+from models.users import User, UserRole
 from models.enrollment import Enrollment, EnrollmentType, EnrollmentState
 from models.group import (
     Group, GroupSet, GroupMembership, GroupAssignment, PeerReview, GroupInvitation,

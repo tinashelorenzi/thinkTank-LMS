@@ -4,7 +4,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Path, UploadFile, File, BackgroundTasks
 
 from models.course import Course
-from models.user import User, UserRole
+from models.users import User, UserRole
 from models.enrollment import Enrollment, EnrollmentType, EnrollmentState
 from models.assignment import Assignment
 from models.submission import Submission, SubmissionAttachment, Grade, Comment, SubmissionStatus

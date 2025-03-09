@@ -4,7 +4,7 @@ from typing import Any, Dict
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, status
 from fastapi.security import OAuth2PasswordRequestForm
 
-from models.user import User, UserRole
+from models.users import User, UserRole
 from schemas.token import Token
 from schemas.user import UserCreate, UserResponse
 from core.config import settings

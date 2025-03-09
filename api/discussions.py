@@ -4,7 +4,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Path, BackgroundTasks
 
 from models.course import Course, Section
-from models.user import User, UserRole
+from models.users import User, UserRole
 from models.assignment import Assignment
 from models.enrollment import Enrollment, EnrollmentType, EnrollmentState
 from models.discussion import (

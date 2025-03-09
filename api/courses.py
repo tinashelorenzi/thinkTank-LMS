@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Path
 
 from models.course import Course, Section, CourseVisibility, CourseState
-from models.user import User, UserRole
+from models.users import User, UserRole
 from models.enrollment import Enrollment, EnrollmentType, EnrollmentState
 from schemas.course import (
     CourseCreate, CourseUpdate, CourseResponse, CourseListResponse,
